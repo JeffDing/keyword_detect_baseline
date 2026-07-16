@@ -135,7 +135,7 @@ def main():
     crit = torch.nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(TRAIN.pos_weight, device=device))
 
-    # debug_printed = False
+    best = 0.0
     for ep in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
