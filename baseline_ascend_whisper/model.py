@@ -6,13 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class WhisperBackbone:
+class WhisperBackbone(nn.Module):
     """Whisper 预训练音频编码器，输出逐帧 embedding。"""
 
     def __init__(self, model_name: str = "tiny", device: str = "cpu"):
+        super().__init__()
         import whisper
 
-        self.whisper = whisper.load_model(model_name, device=device)
+        self.whisper = whisper.load_model(model_name, device="cpu")
         self.whisper.eval()
         self.n_mels = self.whisper.dims.n_mels
         self.n_audio_ctx = self.whisper.dims.n_audio_ctx
@@ -22,12 +23,12 @@ class WhisperBackbone:
             param.requires_grad = False
 
         encoder_param = next(self.whisper.encoder.parameters())
-        print(f"[WhisperBackbone] device={device}, encoder_param_device={encoder_param.device}")
+        print(f"[WhisperBackbone] target_device={device}, encoder_param_device_before_to={encoder_param.device}")
 
     @torch.no_grad()
-    def __call__(self, mel: torch.Tensor) -> torch.Tensor:
-        feat = self.whisper.encoder(mel.detach().float())
-        return feat.to(mel)
+    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+        feat = self.whisper.encoder(mel.detach())
+        return feat
 
 
 class FrameMatcher(nn.Module):
@@ -65,6 +66,7 @@ class SiameseKWS(nn.Module):
         self.matcher = FrameMatcher(whisper_dim, embed_dim)
         self.scale = nn.Parameter(torch.tensor(8.0, device=device))
         self.bias = nn.Parameter(torch.tensor(0.0, device=device))
+        self.to(device)
 
     def forward(self, enroll: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
         e_feat = self.backbone(enroll)

@@ -7,16 +7,18 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("MKL_NUM_THREADS", "4")
 
 import argparse
+import math
 import time
 
 import numpy as np
 import torch
+import whisper
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
+from whisper.audio import mel_filters
 
 from config import AUDIO, PATHS, TRAIN
-from data import PairDataset, collate, load_pairs, load_similar_pairs
+from data import batch_read_pairs, load_pairs, load_similar_pairs, preload_zip
 from model import SiameseKWS
 
 
@@ -27,26 +29,56 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=TRAIN.lr)
     ap.add_argument("--subset", type=int, default=TRAIN.train_subset,
                     help="训练子集大小，越小分数通常越低")
-    ap.add_argument("--workers", type=int, default=TRAIN.num_workers)
     ap.add_argument("--hard_mining_every", type=int, default=TRAIN.hard_mining_every)
     ap.add_argument("--hard_top_k", type=int, default=TRAIN.hard_top_k)
     ap.add_argument("--hard_weight", type=float, default=TRAIN.hard_weight)
     ap.add_argument("--out", type=str, default=os.path.join(PATHS.ckpt_dir, "best.pt"))
-    ap.add_argument("--persistent_workers", type=lambda x: x.lower() == "true",
-                    default=TRAIN.persistent_workers)
-    ap.add_argument("--prefetch_factor", type=int, default=TRAIN.prefetch_factor)
     return ap.parse_args()
 
 
+def npu_batch_mel(wavs_cpu: torch.Tensor, device: str,
+                  n_mels: int = 80, max_frames: int = 3000,
+                  sub_bs: int = 32) -> torch.Tensor:
+    mels = []
+    mel_fb = mel_filters(torch.device(device), n_mels)
+    for i in range(0, wavs_cpu.size(0), sub_bs):
+        wav_sub = wavs_cpu[i:i + sub_bs].to(device)
+        window = torch.hann_window(400, device=device, dtype=wav_sub.dtype)
+        spec = torch.stft(
+            wav_sub, n_fft=400, hop_length=160, win_length=400,
+            window=window, center=True, pad_mode="reflect",
+            normalized=False, onesided=True, return_complex=True,
+        )
+        magnitudes = spec.real.square() + spec.imag.square()
+        magnitudes = magnitudes[..., :-1]
+        mel_spec = torch.matmul(mel_fb, magnitudes)
+        log_spec = torch.clamp(mel_spec, min=1e-10).log() / math.log(10)
+        max_vals = log_spec.amax(dim=(-2, -1), keepdim=True)
+        log_spec = torch.maximum(log_spec, max_vals - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        log_spec = log_spec[:, :, :max_frames]
+        if log_spec.size(2) < max_frames:
+            log_spec = torch.nn.functional.pad(log_spec, (0, max_frames - log_spec.size(2)))
+        mels.append(log_spec)
+    return torch.cat(mels, dim=0)
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, desc="eval"):
+def evaluate(model, pairs, zip_path, device, desc="eval"):
     model.eval()
     probs, labels = [], []
-    pbar = tqdm(loader, desc=desc, dynamic_ncols=True, leave=False)
-    for e, q, y, _ in pbar:
-        e, q = e.to(device), q.to(device)
-        logit = model(e, q)
-        probs.append(torch.sigmoid(logit).cpu().numpy())
+    n = len(pairs)
+    bs = 256
+    pbar = tqdm(range(0, n, bs), desc=desc, dynamic_ncols=True, leave=False)
+    for start in pbar:
+        end = min(start + bs, n)
+        batch_pairs = pairs[start:end]
+        e, q, y, _ = batch_read_pairs(batch_pairs, zip_path, AUDIO, inference=False)
+        e_mel = npu_batch_mel(e, device, n_mels=AUDIO.n_mels, max_frames=AUDIO.max_frames)
+        q_mel = npu_batch_mel(q, device, n_mels=AUDIO.n_mels, max_frames=AUDIO.max_frames)
+        with torch.npu.amp.autocast(enabled=True):
+            logit = model(e_mel, q_mel)
+        probs.append(torch.sigmoid(logit.float()).cpu().numpy())
         labels.append(y.numpy())
     return roc_auc_score(np.concatenate(labels), np.concatenate(probs))
 
@@ -106,25 +138,12 @@ def main():
     train_pairs = [all_pairs[i] for i in idx]
     print(f"train: {n} / {len(all_pairs)} pairs (incl. similar={len(similar_pairs)})")
 
-    train_ds = PairDataset(train_pairs, PATHS.train_zip, AUDIO)
-    persistent_workers = args.persistent_workers and args.workers > 0
-    loader_kwargs = dict(
-        num_workers=args.workers,
-        collate_fn=collate,
-        persistent_workers=persistent_workers,
-    )
-    if persistent_workers:
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    preload_zip(PATHS.train_zip)
+    preload_zip(PATHS.dev_seen_zip)
+    preload_zip(PATHS.dev_unseen_zip)
 
-    train_loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                              drop_last=True, **loader_kwargs)
-
-    def dev_loader(zip_p, csv_p):
-        ds = PairDataset(load_pairs(csv_p, True), zip_p, AUDIO)
-        return DataLoader(ds, batch_size=args.bs, shuffle=False, **loader_kwargs)
-
-    dev_seen = dev_loader(PATHS.dev_seen_zip, PATHS.dev_seen_csv)
-    dev_unseen = dev_loader(PATHS.dev_unseen_zip, PATHS.dev_unseen_csv)
+    dev_seen_pairs = load_pairs(PATHS.dev_seen_csv, True)
+    dev_unseen_pairs = load_pairs(PATHS.dev_unseen_csv, True)
 
     model = SiameseKWS(AUDIO.whisper_model_name, TRAIN.embed_dim, device=device).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -140,34 +159,42 @@ def main():
         model.train()
         t0 = time.time()
         loss_sum = 0.0
-        pbar = tqdm(train_loader, desc=f"ep{ep}", dynamic_ncols=True)
-        for it, (e, q, y, _) in enumerate(pbar, 1):
-            e, q, y = e.to(device), q.to(device), y.to(device)
-            # if not debug_printed:
-            #     print(f"[debug] e.device={e.device}, q.device={q.device}, y.device={y.device}")
-            #     for name, p in model.named_parameters():
-            #         print(f"[debug] param {name}: device={p.device}")
-            #         break
-            #     debug_printed = True
-            opt.zero_grad()
-            logits = model(e, q)
-            loss = crit(logits, y)
 
-            if args.hard_top_k > 0 and ep % args.hard_mining_every == 0:
-                hard_e, hard_q, hard_y = mine_batch_hard_negatives(
-                    model, e, q, y, top_k=args.hard_top_k)
-                if hard_e is not None:
-                    hard_logits = model(hard_e, hard_q)
-                    loss_hard = crit(hard_logits, hard_y)
-                    loss = loss + args.hard_weight * loss_hard
+        ep_idx = np.random.permutation(n)
+        ep_pairs = [train_pairs[i] for i in ep_idx]
+        n_batches = n // args.bs
+
+        pbar = tqdm(range(n_batches), desc=f"ep{ep}", dynamic_ncols=True)
+        for it in pbar:
+            start = it * args.bs
+            end = start + args.bs
+            batch_pairs = ep_pairs[start:end]
+
+            e, q, y, _ = batch_read_pairs(batch_pairs, PATHS.train_zip, AUDIO, inference=False)
+            e_mel = npu_batch_mel(e, device, n_mels=AUDIO.n_mels, max_frames=AUDIO.max_frames)
+            q_mel = npu_batch_mel(q, device, n_mels=AUDIO.n_mels, max_frames=AUDIO.max_frames)
+            y = y.to(device)
+
+            opt.zero_grad()
+            with torch.npu.amp.autocast(enabled=True):
+                logits = model(e_mel, q_mel)
+                loss = crit(logits, y)
+
+                if args.hard_top_k > 0 and ep % args.hard_mining_every == 0:
+                    hard_e, hard_q, hard_y = mine_batch_hard_negatives(
+                        model, e_mel, q_mel, y, top_k=args.hard_top_k)
+                    if hard_e is not None:
+                        hard_logits = model(hard_e, hard_q)
+                        loss_hard = crit(hard_logits, hard_y)
+                        loss = loss + args.hard_weight * loss_hard
 
             loss.backward()
             opt.step()
             loss_sum += loss.item()
-            pbar.set_postfix({"loss": f"{loss_sum/it:.4f}"})
+            pbar.set_postfix({"loss": f"{loss_sum/(it+1):.4f}"})
 
-        auc_s = evaluate(model, dev_seen, device, desc="seen")
-        auc_u = evaluate(model, dev_unseen, device, desc="unseen")
+        auc_s = evaluate(model, dev_seen_pairs, PATHS.dev_seen_zip, device, desc="seen")
+        auc_u = evaluate(model, dev_unseen_pairs, PATHS.dev_unseen_zip, device, desc="unseen")
         mean = (auc_s + auc_u) / 2
         print(f"[epoch {ep}] seen={auc_s:.4f} unseen={auc_u:.4f} "
               f"mean={mean:.4f} ({time.time()-t0:.0f}s)")

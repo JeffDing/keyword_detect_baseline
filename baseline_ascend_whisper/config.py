@@ -13,7 +13,7 @@ class AudioConfig:
     hop_length: int = 160
     n_mels: int = 80           
     max_frames: int = 3000     
-    whisper_model_name: str = "large-v2"
+    whisper_model_name: str = "tiny"
 
 
 @dataclass
