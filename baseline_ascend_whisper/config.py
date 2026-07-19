@@ -13,7 +13,7 @@ class AudioConfig:
     hop_length: int = 160
     n_mels: int = 80           
     max_frames: int = 3000     
-    whisper_model_name: str = "tiny"
+    whisper_model_name: str = "large-v2"
 
 
 @dataclass
@@ -21,9 +21,9 @@ class TrainConfig:
     embed_dim: int = 64
     batch_size: int = 128
     num_workers: int = 0
-    epochs: int = 10
+    epochs: int = 100
     lr: float = 1e-3
-    pos_weight: float = 4.0   
+    pos_weight: float = 3.0   
     train_subset: int = 500000  
     seed: int = 42
     log_every: int = 100
