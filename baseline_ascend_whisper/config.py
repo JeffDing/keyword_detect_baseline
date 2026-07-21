@@ -18,13 +18,13 @@ class AudioConfig:
 
 @dataclass
 class TrainConfig:
-    embed_dim: int = 64
+    embed_dim: int = 256
     batch_size: int = 128
     num_workers: int = 0
-    epochs: int = 100
+    epochs: int = 5
     lr: float = 1e-3
-    pos_weight: float = 3.0   
-    train_subset: int = 500000  
+    pos_weight: float = 3.0
+    train_subset: int = 500000
     seed: int = 42
     log_every: int = 100
     hard_mining_every: int = 5
@@ -33,6 +33,12 @@ class TrainConfig:
     hard_use_global: bool = True
     persistent_workers: bool = False
     prefetch_factor: int = 2
+    use_mlp: bool = True
+    warmup_epochs: int = 5
+    save_top_k: int = 3
+    spec_augment: bool = True
+    spec_aug_freq_mask: int = 2
+    spec_aug_time_mask: int = 10
 
 
 @dataclass

@@ -32,11 +32,19 @@ class WhisperBackbone(nn.Module):
 
 
 class FrameMatcher(nn.Module):
-    """逐帧投影 + 对称 max-mean 软对齐。"""
+    """逐帧投影 + 对称 max-mean 软对齐 + 可学习温度。"""
 
-    def __init__(self, whisper_dim: int, embed_dim: int = 64):
+    def __init__(self, whisper_dim: int, embed_dim: int = 256, use_mlp: bool = True):
         super().__init__()
-        self.proj = nn.Linear(whisper_dim, embed_dim)
+        if use_mlp:
+            self.proj = nn.Sequential(
+                nn.Linear(whisper_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+        else:
+            self.proj = nn.Linear(whisper_dim, embed_dim)
+        self.log_temp = nn.Parameter(torch.tensor(0.0))
 
     def _norm_feat(self, feat: torch.Tensor) -> torch.Tensor:
         return F.normalize(self.proj(feat), dim=-1)
@@ -44,7 +52,8 @@ class FrameMatcher(nn.Module):
     def forward(self, e_feat: torch.Tensor, q_feat: torch.Tensor) -> torch.Tensor:
         e = self._norm_feat(e_feat)
         q = self._norm_feat(q_feat)
-        sim = torch.matmul(e, q.transpose(1, 2))
+        temp = self.log_temp.exp().clamp(min=0.1, max=100.0)
+        sim = torch.matmul(e, q.transpose(1, 2)) / temp
         score_e2q = sim.max(dim=2)[0].mean(dim=1)
         score_q2e = sim.max(dim=1)[0].mean(dim=1)
         return (score_e2q + score_q2e) / 2
@@ -59,11 +68,12 @@ class FrameMatcher(nn.Module):
 
 
 class SiameseKWS(nn.Module):
-    def __init__(self, whisper_model_name: str = "tiny", embed_dim: int = 64, device: str = "cpu"):
+    def __init__(self, whisper_model_name: str = "tiny", embed_dim: int = 256,
+                 device: str = "cpu", use_mlp: bool = True):
         super().__init__()
         self.backbone = WhisperBackbone(whisper_model_name, device=device)
         whisper_dim = self.backbone.n_audio_state
-        self.matcher = FrameMatcher(whisper_dim, embed_dim)
+        self.matcher = FrameMatcher(whisper_dim, embed_dim, use_mlp=use_mlp)
         self.scale = nn.Parameter(torch.tensor(8.0, device=device))
         self.bias = nn.Parameter(torch.tensor(0.0, device=device))
         self.to(device)

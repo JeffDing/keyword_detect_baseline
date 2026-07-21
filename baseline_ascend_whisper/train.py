@@ -32,8 +32,30 @@ def parse_args():
     ap.add_argument("--hard_mining_every", type=int, default=TRAIN.hard_mining_every)
     ap.add_argument("--hard_top_k", type=int, default=TRAIN.hard_top_k)
     ap.add_argument("--hard_weight", type=float, default=TRAIN.hard_weight)
+    ap.add_argument("--embed_dim", type=int, default=TRAIN.embed_dim)
+    ap.add_argument("--use_mlp", action="store_true", default=TRAIN.use_mlp)
+    ap.add_argument("--no_mlp", action="store_true")
+    ap.add_argument("--warmup_epochs", type=int, default=TRAIN.warmup_epochs)
+    ap.add_argument("--save_top_k", type=int, default=TRAIN.save_top_k)
+    ap.add_argument("--spec_augment", action="store_true", default=TRAIN.spec_augment)
+    ap.add_argument("--no_spec_augment", action="store_true")
     ap.add_argument("--out", type=str, default=os.path.join(PATHS.ckpt_dir, "best.pt"))
     return ap.parse_args()
+
+
+def spec_augment(mel: torch.Tensor, freq_mask: int = 2, time_mask: int = 10) -> torch.Tensor:
+    B, n_mels, T = mel.shape
+    device = mel.device
+    augmented = mel.clone()
+    for _ in range(freq_mask):
+        f = torch.randint(0, max(freq_mask, 1), (1,)).item()
+        f0 = torch.randint(0, max(n_mels - f, 1), (1,)).item()
+        augmented[:, f0:f0 + f, :] = 0
+    for _ in range(time_mask):
+        t = torch.randint(0, max(time_mask, 1), (1,)).item()
+        t0 = torch.randint(0, max(T - t, 1), (1,)).item()
+        augmented[:, :, t0:t0 + t] = 0
+    return augmented
 
 
 def npu_batch_mel(wavs_cpu: torch.Tensor, device: str,
@@ -120,8 +142,31 @@ def mine_batch_hard_negatives(model, e, q, y, top_k=1):
     return torch.cat(hard_e), torch.cat(hard_q), torch.cat(hard_y)
 
 
+class CosineWarmupScheduler:
+    def __init__(self, optimizer, warmup_steps: int, total_steps: int):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+
+    def step(self, current_step: int):
+        if current_step < self.warmup_steps:
+            scale = current_step / max(self.warmup_steps, 1)
+        else:
+            progress = (current_step - self.warmup_steps) / max(
+                self.total_steps - self.warmup_steps, 1)
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            group["lr"] = base_lr * scale
+
+
 def main():
     args = parse_args()
+    if args.no_mlp:
+        args.use_mlp = False
+    if args.no_spec_augment:
+        args.spec_augment = False
+
     torch.manual_seed(TRAIN.seed)
     np.random.seed(TRAIN.seed)
     device = "npu" if torch.npu.is_available() else "cpu"
@@ -137,6 +182,8 @@ def main():
     idx = np.random.default_rng(TRAIN.seed).permutation(len(all_pairs))[:n]
     train_pairs = [all_pairs[i] for i in idx]
     print(f"train: {n} / {len(all_pairs)} pairs (incl. similar={len(similar_pairs)})")
+    print(f"config: embed_dim={args.embed_dim}, use_mlp={args.use_mlp}, "
+          f"spec_augment={args.spec_augment}, warmup={args.warmup_epochs}")
 
     preload_zip(PATHS.train_zip)
     preload_zip(PATHS.dev_seen_zip)
@@ -145,16 +192,25 @@ def main():
     dev_seen_pairs = load_pairs(PATHS.dev_seen_csv, True)
     dev_unseen_pairs = load_pairs(PATHS.dev_unseen_csv, True)
 
-    model = SiameseKWS(AUDIO.whisper_model_name, TRAIN.embed_dim, device=device).to(device)
+    model = SiameseKWS(AUDIO.whisper_model_name, args.embed_dim,
+                       device=device, use_mlp=args.use_mlp).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model params: {n_params:,} ({n_params/1e6:.2f}M)")
-    print(f"[train] device={device}, torch.npu.current_device()={torch.npu.current_device()}")
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"model params: {n_params:,} ({n_params/1e6:.2f}M), trainable: {n_trainable:,}")
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     crit = torch.nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(TRAIN.pos_weight, device=device))
 
+    n_batches = n // args.bs
+    total_steps = args.epochs * n_batches
+    warmup_steps = args.warmup_epochs * n_batches
+    scheduler = CosineWarmupScheduler(opt, warmup_steps, total_steps)
+
     best = 0.0
+    topk_ckpts = []
+    global_step = 0
+
     for ep in range(1, args.epochs + 1):
         model.train()
         t0 = time.time()
@@ -162,7 +218,6 @@ def main():
 
         ep_idx = np.random.permutation(n)
         ep_pairs = [train_pairs[i] for i in ep_idx]
-        n_batches = n // args.bs
 
         pbar = tqdm(range(n_batches), desc=f"ep{ep}", dynamic_ncols=True)
         for it in pbar:
@@ -173,6 +228,11 @@ def main():
             e, q, y, _ = batch_read_pairs(batch_pairs, PATHS.train_zip, AUDIO, inference=False)
             e_mel = npu_batch_mel(e, device, n_mels=AUDIO.n_mels, max_frames=AUDIO.max_frames)
             q_mel = npu_batch_mel(q, device, n_mels=AUDIO.n_mels, max_frames=AUDIO.max_frames)
+
+            if args.spec_augment and model.training:
+                e_mel = spec_augment(e_mel, TRAIN.spec_aug_freq_mask, TRAIN.spec_aug_time_mask)
+                q_mel = spec_augment(q_mel, TRAIN.spec_aug_freq_mask, TRAIN.spec_aug_time_mask)
+
             y = y.to(device)
 
             opt.zero_grad()
@@ -190,8 +250,11 @@ def main():
 
             loss.backward()
             opt.step()
+            scheduler.step(global_step)
+            global_step += 1
             loss_sum += loss.item()
-            pbar.set_postfix({"loss": f"{loss_sum/(it+1):.4f}"})
+            pbar.set_postfix({"loss": f"{loss_sum/(it+1):.4f}",
+                              "lr": f"{opt.param_groups[0]['lr']:.2e}"})
 
         auc_s = evaluate(model, dev_seen_pairs, PATHS.dev_seen_zip, device, desc="seen")
         auc_u = evaluate(model, dev_unseen_pairs, PATHS.dev_unseen_zip, device, desc="unseen")
@@ -199,15 +262,29 @@ def main():
         print(f"[epoch {ep}] seen={auc_s:.4f} unseen={auc_u:.4f} "
               f"mean={mean:.4f} ({time.time()-t0:.0f}s)")
 
+        ckpt_data = {
+            "model": model.state_dict(),
+            "embed_dim": args.embed_dim,
+            "whisper_model": AUDIO.whisper_model_name,
+            "use_mlp": args.use_mlp,
+            "auc": mean,
+            "epoch": ep,
+        }
+
         if mean > best:
             best = mean
-            torch.save({"model": model.state_dict(),
-                        "embed_dim": TRAIN.embed_dim,
-                        "whisper_model": AUDIO.whisper_model_name,
-                        "auc": mean}, args.out)
-            print(f"  saved -> {args.out}")
+            torch.save(ckpt_data, args.out)
+            print(f"  saved best -> {args.out}")
+
+        topk_ckpts.append((mean, ep, ckpt_data))
+        topk_ckpts.sort(key=lambda x: x[0], reverse=True)
+        topk_ckpts = topk_ckpts[:args.save_top_k]
+        for rank, (auc_val, ep_val, data) in enumerate(topk_ckpts):
+            path = os.path.join(PATHS.ckpt_dir, f"top{rank+1}.pt")
+            torch.save(data, path)
 
     print(f"done. best dev mean AUC = {best:.4f}")
+    print(f"top-{args.save_top_k} checkpoints saved in {PATHS.ckpt_dir}")
 
 
 if __name__ == "__main__":
